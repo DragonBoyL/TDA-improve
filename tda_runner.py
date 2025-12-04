@@ -18,7 +18,7 @@ def get_arguments():
     parser.add_argument('--config', dest='config', required=True, help='settings of TDA on specific dataset in yaml format.')
     parser.add_argument('--wandb-log', dest='wandb', action='store_true', help='Whether you want to log to wandb. Include this flag to enable logging.')
     parser.add_argument('--datasets', dest='datasets', type=str, required=True, help="Datasets to process, separated by a slash (/). Example: I/A/V/R/S")
-    parser.add_argument('--data-root', dest='data_root', type=str, default='./dataset/', help='Path to the datasets directory. Default is ./dataset/')
+    parser.add_argument('--data-root', dest='data_root', type=str, default='./DATA/', help='Path to the datasets directory. Default is ./dataset/')
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
 
     args = parser.parse_args()
@@ -76,7 +76,7 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
             neg_params = {k: neg_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'entropy_threshold', 'mask_threshold']}
 
         #Test-time adaptation
-        for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')):
+        for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')): # tqdm显示测试集处理进度条
             image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images ,clip_model, clip_weights)
             target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights)
 
@@ -129,9 +129,9 @@ def main():
         print("\nRunning dataset configurations:")
         print(cfg, "\n")
         
-        test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess)
-        clip_weights = clip_classifier(classnames, template, clip_model)
-
+        test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess) ## 测试图像的datacloader, 类别名称，模板
+        clip_weights = clip_classifier(classnames, template, clip_model) # [D, C] 特征维度 x class类别数
+        
         if args.wandb:
             run_name = f"{dataset_name}"
             run = wandb.init(project="ETTA-CLIP", config=cfg, group=group_name, name=run_name)

@@ -48,16 +48,16 @@ def clip_classifier(classnames, template, clip_model):
         for classname in classnames:
             # Tokenize the prompts
             classname = classname.replace('_', ' ')
-            texts = [t.format(classname) for t in template]
+            texts = [t.format(classname) for t in template] # template = ["a photo of a {}."] → ["a photo of a tench."]
             texts = clip.tokenize(texts).cuda()
             # prompt ensemble for ImageNet
-            class_embeddings = clip_model.encode_text(texts)
-            class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
-            class_embedding = class_embeddings.mean(dim=0)
-            class_embedding /= class_embedding.norm()
-            clip_weights.append(class_embedding)
+            class_embeddings = clip_model.encode_text(texts)    # [N, D]
+            class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True) # [N， D]
+            class_embedding = class_embeddings.mean(dim=0) # [D]
+            class_embedding /= class_embedding.norm() # [D]
+            clip_weights.append(class_embedding) # c个元素，每个元素D维
 
-        clip_weights = torch.stack(clip_weights, dim=1).cuda()
+        clip_weights = torch.stack(clip_weights, dim=1).cuda() # [D, C] dim = 1 相当于做了转置操作，便于后面直接相乘
     return clip_weights
 
 
@@ -71,17 +71,17 @@ def get_clip_logits(images, clip_model, clip_weights):
         image_features = clip_model.encode_image(images)
         image_features /= image_features.norm(dim=-1, keepdim=True)
 
-        clip_logits = 100. * image_features @ clip_weights
+        clip_logits = 100. * image_features @ clip_weights # [B, C] 将相似度（范围 -1 ~ 1）缩放至 -100 ~ 100，适配分类得分的数值习惯 
 
         if image_features.size(0) > 1:
-            batch_entropy = softmax_entropy(clip_logits)
-            selected_idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * 0.1)]
-            output = clip_logits[selected_idx]
-            image_features = image_features[selected_idx].mean(0).unsqueeze(0)
-            clip_logits = output.mean(0).unsqueeze(0)
+            batch_entropy = softmax_entropy(clip_logits) # [B]
+            selected_idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * 0.1)] # 筛选熵值最小的10%样本（高置信度样本）
+            output = clip_logits[selected_idx] # [0.1B, C]
+            image_features = image_features[selected_idx].mean(0).unsqueeze(0) # [1, D]
+            clip_logits = output.mean(0).unsqueeze(0) # [1, C]
 
-            loss = avg_entropy(output)
-            prob_map = output.softmax(1).mean(0).unsqueeze(0)
+            loss = avg_entropy(output) 
+            prob_map = output.softmax(1).mean(0).unsqueeze(0) # [1, C]
             pred = int(output.mean(0).unsqueeze(0).topk(1, 1, True, True)[1].t())
         else:
             loss = softmax_entropy(clip_logits)
