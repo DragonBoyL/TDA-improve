@@ -18,7 +18,7 @@ def get_arguments():
     parser.add_argument('--config', dest='config', required=True, help='settings of TDA on specific dataset in yaml format.')
     parser.add_argument('--wandb-log', dest='wandb', action='store_true', help='Whether you want to log to wandb. Include this flag to enable logging.')
     parser.add_argument('--datasets', dest='datasets', type=str, required=True, help="Datasets to process, separated by a slash (/). Example: I/A/V/R/S")
-    parser.add_argument('--data-root', dest='data_root', type=str, default='./DATA/', help='Path to the datasets directory. Default is ./dataset/')
+    parser.add_argument('--data-root', dest='data_root', type=str, default='/root/dataset/TestTimeData', help='Path to the datasets directory. Default is ./dataset/')
     parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
 
     args = parser.parse_args()
@@ -78,7 +78,7 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
         #Test-time adaptation
         for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')): # tqdm显示测试集处理进度条
             image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images ,clip_model, clip_weights)
-            target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights)
+            target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights) # 对熵进行归一化
 
             if pos_enabled:
                 update_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])

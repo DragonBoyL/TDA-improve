@@ -16,8 +16,8 @@ try:
 except ImportError:
     BICUBIC = Image.BICUBIC
 
-def get_entropy(loss, clip_weights):
-    max_entropy = math.log2(clip_weights.size(1))
+def get_entropy(loss, clip_weights): # 熵值的「归一化处理」函数
+    max_entropy = math.log2(clip_weights.size(1)) #最大熵：当模型对所有类别完全不确定（均匀分布，\(p_i = 1/C\)），熵值达到理论最大值 \(H_{max} = \log_2(C)\)
     return float(loss / max_entropy)
 
 
@@ -25,12 +25,13 @@ def softmax_entropy(x):
     return -(x.softmax(1) * x.log_softmax(1)).sum(1)
 
 
-def avg_entropy(outputs):
-    logits = outputs - outputs.logsumexp(dim=-1, keepdim=True)
-    avg_logits = logits.logsumexp(dim=0) - np.log(logits.shape[0])
-    min_real = torch.finfo(avg_logits.dtype).min
-    avg_logits = torch.clamp(avg_logits, min=min_real)
-    return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
+def avg_entropy(outputs): # [0.1B, C]  
+    #「集合平均熵」：先把 B 个样本的概率分布取平均，再计算熵
+    logits = outputs - outputs.logsumexp(dim=-1, keepdim=True) # 每个元素是对应类别的对数概率 log(p)  [0.1B, C]
+    avg_logits = logits.logsumexp(dim=0) - np.log(logits.shape[0]) # [C] 每个元素是平均概率的对数 
+    min_real = torch.finfo(avg_logits.dtype).min # 获取当前数据类型（如 float32）的最小可表示值
+    avg_logits = torch.clamp(avg_logits, min=min_real) # torch.clamp(input, min=None, max=None) 是 PyTorch 中用于「截断张量数值范围」的函数。将 avg_logits 张量的所有元素限制在「当前数据类型可表示的最小值」以上，避免因数值过小导致的计算错误
+    return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1) # 标量，熵值
 
 
 def cls_acc(output, target, topk=1):
@@ -77,15 +78,15 @@ def get_clip_logits(images, clip_model, clip_weights):
             batch_entropy = softmax_entropy(clip_logits) # [B]
             selected_idx = torch.argsort(batch_entropy, descending=False)[:int(batch_entropy.size()[0] * 0.1)] # 筛选熵值最小的10%样本（高置信度样本）
             output = clip_logits[selected_idx] # [0.1B, C]
-            image_features = image_features[selected_idx].mean(0).unsqueeze(0) # [1, D]
+            image_features = image_features[selected_idx].mean(0).unsqueeze(0) # [0.1B, D] -> [1, D]
             clip_logits = output.mean(0).unsqueeze(0) # [1, C]
 
             loss = avg_entropy(output) 
             prob_map = output.softmax(1).mean(0).unsqueeze(0) # [1, C]
-            pred = int(output.mean(0).unsqueeze(0).topk(1, 1, True, True)[1].t())
+            pred = int(output.mean(0).unsqueeze(0).topk(1, 1, True, True)[1].t()) #在类别维度（dim=1）取 Top1 得分：第一个1：取前 1 个值；第二个1：类别维度；True：降序排列；True：返回值和索引
         else:
-            loss = softmax_entropy(clip_logits)
-            prob_map = clip_logits.softmax(1)
+            loss = softmax_entropy(clip_logits) # [1]
+            prob_map = clip_logits.softmax(1) # [1, C]
             pred = int(clip_logits.topk(1, 1, True, True)[1].t()[0])
 
         return image_features, clip_logits, loss, prob_map, pred

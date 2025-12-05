@@ -26,13 +26,16 @@ Follow these steps to set up a conda environment and ensure all necessary packag
 git clone https://github.com/kdiAAA/TDA.git
 cd TDA
 
-conda create -n tda python=3.7
-conda activate tda
+conda create -n tda_py310 python=3.10
+conda activate tda_py310
 
 # The results are produced with PyTorch 1.12.1 and CUDA 11.3
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.3 -c pytorch
+pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 
 pip install -r requirements.txt
+
+pip install --upgrade wandb
+
 ```
 
 ### Dataset
