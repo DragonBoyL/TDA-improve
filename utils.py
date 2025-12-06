@@ -35,9 +35,9 @@ def avg_entropy(outputs): # [0.1B, C]
 
 
 def cls_acc(output, target, topk=1):
-    pred = output.topk(topk, 1, True, True)[1].t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-    acc = float(correct[: topk].reshape(-1).float().sum(0, keepdim=True).cpu().numpy())
+    pred = output.topk(topk, 1, True, True)[1].t() # [1，1] topk=1：取每个样本得分最高的 1 个类别；dim=1：沿「类别维度」取 Top-k；largest=True：取得分最大的类别（降序）；sorted=True：结果按得分降序排列；返回值：元组 (values, indices)，[1] 取类别索引（而非得分值）；
+    correct = pred.eq(target.view(1, -1).expand_as(pred))# [1, 1]
+    acc = float(correct[: topk].reshape(-1).float().sum(0, keepdim=True).cpu().numpy())# [1]
     acc = 100 * acc / target.shape[0]
     return acc
 

@@ -27,7 +27,12 @@ def get_arguments():
 
 
 def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
-    """Update cache with new features and loss, maintaining the maximum shot capacity."""
+    """Update cache with new features and loss, maintaining the maximum shot capacity.
+            features_loss：[image_features, loss, prob_map]：
+                image_features：归一化的图像特征（[1, D]）；
+                loss：熵值（越小→置信度越高）；
+                prob_map：类别概率分布（[1, C]）
+    """
     with torch.no_grad():
         item = features_loss if not include_prob_map else features_loss[:2] + [features_loss[2]]
         if pred in cache:
@@ -35,7 +40,7 @@ def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=Fal
                 cache[pred].append(item)
             elif features_loss[1] < cache[pred][-1][1]:
                 cache[pred][-1] = item
-            cache[pred] = sorted(cache[pred], key=operator.itemgetter(1))
+            cache[pred] = sorted(cache[pred], key=operator.itemgetter(1)) # 根据熵值升序排序
         else:
             cache[pred] = [item]
 
@@ -43,25 +48,25 @@ def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=Fal
 def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
     """Compute logits using positive/negative cache."""
     with torch.no_grad():
-        cache_keys = []
-        cache_values = []
+        cache_keys = []  # 存储缓存中所有样本的特征 [item[0]]
+        cache_values = [] # 正缓存存类别索引，负缓存存概率分布 [item[2]]
         for class_index in sorted(cache.keys()):
             for item in cache[class_index]:
-                cache_keys.append(item[0])
+                cache_keys.append(item[0]) # image_feature[1, D]
                 if neg_mask_thresholds:
-                    cache_values.append(item[2])
+                    cache_values.append(item[2]) # prob_map [1, C]
                 else:
-                    cache_values.append(class_index)
+                    cache_values.append(class_index) # pred 
 
-        cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0)
+        cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0) # [1, D] -> [K, D] -> [D, K] permute交换两个维度
         if neg_mask_thresholds:
-            cache_values = torch.cat(cache_values, dim=0)
-            cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half()
+            cache_values = torch.cat(cache_values, dim=0) # [K, C]
+            cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half() # [K, C] 掩码过滤：仅保留概率在 (min, max) 之间的类别
         else:
-            cache_values = (F.one_hot(torch.Tensor(cache_values).to(torch.int64), num_classes=clip_weights.size(1))).cuda().half()
+            cache_values = (F.one_hot(torch.Tensor(cache_values).to(torch.int64), num_classes=clip_weights.size(1))).cuda().half() # [K, C]正缓存，生成one-hot编码  
 
-        affinity = image_features @ cache_keys
-        cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values
+        affinity = image_features @ cache_keys # [1, K]
+        cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values # [1 ,C] 每一个类别的修正得分，每一列表示所有缓存样本对该类别的贡献总和（亲和度越高，贡献越大）
         return alpha * cache_logits
 
 def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
@@ -86,7 +91,7 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
             if neg_enabled and neg_params['entropy_threshold']['lower'] < prop_entropy < neg_params['entropy_threshold']['upper']:
                 update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_params['shot_capacity'], True)
 
-            final_logits = clip_logits.clone()
+            final_logits = clip_logits.clone() # [1, K]
             if pos_enabled and pos_cache:
                 final_logits += compute_cache_logits(image_features, pos_cache, pos_params['alpha'], pos_params['beta'], clip_weights)
             if neg_enabled and neg_cache:
