@@ -92,7 +92,7 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
                 update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_params['shot_capacity'], True)
 
             final_logits = clip_logits.clone() # [1, K]
-            if pos_enabled and pos_cache:
+            if pos_enabled and pos_cache: # 第一次cache为空
                 final_logits += compute_cache_logits(image_features, pos_cache, pos_params['alpha'], pos_params['beta'], clip_weights)
             if neg_enabled and neg_cache:
                 final_logits -= compute_cache_logits(image_features, neg_cache, neg_params['alpha'], neg_params['beta'], clip_weights, (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper']))
