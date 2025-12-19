@@ -1,0 +1,213 @@
+import random
+import argparse
+import wandb
+from tqdm import tqdm
+from datetime import datetime
+
+import torch
+import torch.nn.functional as F
+import operator
+
+import clip
+from utils import *
+
+# 初始化一个全局协方差矩阵（全局或类别级缓存，视具体策略可调整）
+cov_matrix = None
+num_features = None
+feature_count = 0
+
+def get_arguments():
+    """Get arguments of the test-time adaptation."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', dest='config', required=True, help='settings of TDA on specific dataset in yaml format.')
+    parser.add_argument('--wandb-log', dest='wandb', action='store_true', help='Whether you want to log to wandb. Include this flag to enable logging.')
+    parser.add_argument('--datasets', dest='datasets', type=str, required=True, help="Datasets to process, separated by a slash (/). Example: I/A/V/R/S")
+    parser.add_argument('--data-root', dest='data_root', type=str, default='/root/dataset/TestTimeData', help='Path to the datasets directory. Default is ./dataset/')
+    parser.add_argument('--backbone', dest='backbone', type=str, choices=['RN50', 'ViT-B/16'], required=True, help='CLIP model backbone to use: RN50 or ViT-B/16.')
+
+    args = parser.parse_args()
+
+    return args
+
+def project_to_null_space(x):
+    global cov_matrix, feature_count
+    if cov_matrix is None or feature_count < x.shape[1]:
+        print("协方差矩阵数据不足，无法进行投影操作。")
+        print(cov_matrix, feature_count, x.shape[1])
+        return x # 暂不投影，数据不足
+    try:
+        eigvals, eigvecs = torch.linalg.eigh(cov_matrix.float()) 
+        threshold = 1e-5 * torch.max(eigvals)
+        null_mask = eigvals < threshold
+        if not torch.any(null_mask):
+            print("没有找到零空间，跳过投影操作。")
+            return x
+        U2 = eigvecs[:, null_mask] # [D, k]
+        x_proj = (x.float() @ U2) @ U2.T
+        return x_proj.to(x.dtype)
+    except Exception as e:
+        print(f"协方差矩阵特征分解失败，跳过投影操作。错误信息：{e}")
+        return x
+
+
+def update_cov_matrix(x):
+    global cov_matrix, feature_count, num_features
+    x = x.detach()
+    if cov_matrix is None:
+        num_features = x.shape[1]
+        cov_matrix = x.T @ x
+        feature_count = 1
+    else:
+        cov_matrix += x.T @ x
+        feature_count += 1
+            
+def update_positive_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
+    """Update cache with new features and loss, maintaining the maximum shot capacity.
+            features_loss：[image_features, loss, prob_map]：
+                image_features：归一化的图像特征（[1, D]）；
+                loss：熵值（越小→置信度越高）；
+                prob_map：类别概率分布（[1, C]）
+    """
+    with torch.no_grad():
+        raw_feat = features_loss[0] # [1, D]
+        feat_proj = project_to_null_space(raw_feat)
+        update_cov_matrix(feat_proj)
+
+        item = [feat_proj, features_loss[1]]
+        if include_prob_map:
+            item.append(features_loss[2])
+        
+        if pred in cache:
+            if len(cache[pred]) < shot_capacity:
+                cache[pred].append(item)
+            elif features_loss[1] < cache[pred][-1][1]:
+                cache[pred][-1] = item
+            cache[pred] = sorted(cache[pred], key=operator.itemgetter(1)) # 根据熵值升序排序
+        else:
+            cache[pred] = [item]
+
+
+def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
+    """Update cache with new features and loss, maintaining the maximum shot capacity.
+            features_loss：[image_features, loss, prob_map]：
+                image_features：归一化的图像特征（[1, D]）；
+                loss：熵值（越小→置信度越高）；
+                prob_map：类别概率分布（[1, C]）
+    """
+    with torch.no_grad():
+        item = features_loss if not include_prob_map else features_loss[:2] + [features_loss[2]]
+        if pred in cache:
+            if len(cache[pred]) < shot_capacity:
+                cache[pred].append(item)
+            elif features_loss[1] < cache[pred][-1][1]:
+                cache[pred][-1] = item
+            cache[pred] = sorted(cache[pred], key=operator.itemgetter(1)) # 根据熵值升序排序
+        else:
+            cache[pred] = [item]
+
+
+def compute_cache_logits(image_features, cache, alpha, beta, clip_weights, neg_mask_thresholds=None):
+    """Compute logits using positive/negative cache."""
+    with torch.no_grad():
+        cache_keys = []  # 存储缓存中所有样本的特征 [item[0]]
+        cache_values = [] # 正缓存存类别索引，负缓存存概率分布 [item[2]]
+        for class_index in sorted(cache.keys()):
+            for item in cache[class_index]:
+                cache_keys.append(item[0]) # image_feature[1, D]
+                if neg_mask_thresholds:
+                    cache_values.append(item[2]) # prob_map [1, C]
+                else:
+                    cache_values.append(class_index) # pred 
+
+        cache_keys = torch.cat(cache_keys, dim=0).permute(1, 0) # [1, D] -> [K, D] -> [D, K] permute交换两个维度
+        if neg_mask_thresholds:
+            cache_values = torch.cat(cache_values, dim=0) # [K, C]
+            cache_values = (((cache_values > neg_mask_thresholds[0]) & (cache_values < neg_mask_thresholds[1])).type(torch.int8)).cuda().half() # [K, C] 掩码过滤：仅保留概率在 (min, max) 之间的类别
+        else:
+            cache_values = (F.one_hot(torch.Tensor(cache_values).to(torch.int64), num_classes=clip_weights.size(1))).cuda().half() # [K, C]正缓存，生成one-hot编码  
+
+        affinity = image_features @ cache_keys # [1, K]
+        cache_logits = ((-1) * (beta - beta * affinity)).exp() @ cache_values # [1 ,C] 每一个类别的修正得分，每一列表示所有缓存样本对该类别的贡献总和（亲和度越高，贡献越大）
+        return alpha * cache_logits
+
+def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
+    with torch.no_grad():
+        pos_cache, neg_cache, accuracies = {}, {}, []
+        
+        #Unpack all hyperparameters
+        pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
+        if pos_enabled:
+            pos_params = {k: pos_cfg[k] for k in ['shot_capacity', 'alpha', 'beta']}
+        if neg_enabled:
+            neg_params = {k: neg_cfg[k] for k in ['shot_capacity', 'alpha', 'beta', 'entropy_threshold', 'mask_threshold']}
+
+        #Test-time adaptation
+        for i, (images, target) in enumerate(tqdm(loader, desc='Processed test images: ')): # tqdm显示测试集处理进度条
+            image_features, clip_logits, loss, prob_map, pred = get_clip_logits(images ,clip_model, clip_weights)
+            target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights) # 对熵进行归一化
+
+            if pos_enabled:
+                update_positive_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])
+                # update_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])
+
+            if neg_enabled and neg_params['entropy_threshold']['lower'] < prop_entropy < neg_params['entropy_threshold']['upper']:
+                update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_params['shot_capacity'], True)
+
+            final_logits = clip_logits.clone() # [1, K]
+            if pos_enabled and pos_cache: # 第一次cache为空
+                final_logits += compute_cache_logits(image_features, pos_cache, pos_params['alpha'], pos_params['beta'], clip_weights)
+            if neg_enabled and neg_cache:
+                final_logits -= compute_cache_logits(image_features, neg_cache, neg_params['alpha'], neg_params['beta'], clip_weights, (neg_params['mask_threshold']['lower'], neg_params['mask_threshold']['upper']))
+
+                
+            acc = cls_acc(final_logits, target)  
+            accuracies.append(acc)
+            wandb.log({"Averaged test accuracy": sum(accuracies)/len(accuracies)}, commit=True)
+
+            if i%1000==0:
+                print("---- TDA's test accuracy: {:.2f}. ----\n".format(sum(accuracies)/len(accuracies)))
+        print("---- TDA's test accuracy: {:.2f}. ----\n".format(sum(accuracies)/len(accuracies)))   
+        return sum(accuracies)/len(accuracies)
+
+
+
+def main():
+    args = get_arguments()
+    config_path = args.config
+
+    # Initialize CLIP model
+    clip_model, preprocess = clip.load(args.backbone)
+    clip_model.eval()
+
+    # Set random seed
+    random.seed(1)
+    torch.manual_seed(1)
+
+    if args.wandb:
+        date = datetime.now().strftime("%b%d_%H-%M-%S")
+        group_name = f"{args.backbone}_{args.datasets}_{date}"
+    
+    # Run TDA on each dataset
+    datasets = args.datasets.split('/')
+    for dataset_name in datasets:
+        print(f"Processing {dataset_name} dataset.")
+        
+        cfg = get_config_file(config_path, dataset_name)
+        print("\nRunning dataset configurations:")
+        print(cfg, "\n")
+        
+        test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess) ## 测试图像的datacloader, 类别名称，模板
+        clip_weights = clip_classifier(classnames, template, clip_model) # [D, C] 特征维度 x class类别数
+        
+        if args.wandb:
+            run_name = f"{dataset_name}"
+            run = wandb.init(project="ETTA-CLIP", config=cfg, group=group_name, name=run_name)
+
+        acc = run_test_tda(cfg['positive'], cfg['negative'], test_loader, clip_model, clip_weights)
+
+        if args.wandb:
+            wandb.log({f"{dataset_name}": acc})
+            run.finish()
+
+if __name__ == "__main__":
+    main()
