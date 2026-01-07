@@ -166,8 +166,32 @@ def replace_with_delta_projection(pos_cache, pos_cov, class_idx, new_feat, loss,
     # 更新缓存
     update_cache(pos_cache, class_idx, [f_corr, loss], pos_params['shot_capacity'])
 
+    verify_null_space_effect(pos_cache, class_idx, Δ_proj)
+
     return True
 
+def verify_null_space_effect(pos_cache, class_idx, delta_f_proj):
+    """验证零空间约束：Δf_proj与历史缓存特征正交（不干扰预测）"""
+    with torch.no_grad():
+        # 1. 提取历史缓存特征（不含被替换的old_feat）
+        cache_list = pos_cache[class_idx]
+        if len(cache_list) <= 1:
+            return  # 无足够历史特征，跳过验证
+        
+        # 核心修复：统一转为float32，避免Half/float不匹配
+        hist_feats = torch.cat([item[0].float() for item in cache_list[:-1]], dim=0)  # [k-1, D] float32
+        delta_f_proj_32 = delta_f_proj.float()  # 确保更新量也是float32
+        
+        # 2. 验证：历史特征 · Δf_proj ≈ 0（正交，无干扰）
+        if hist_feats.size(0) > 0:
+            dot_product = (hist_feats @ delta_f_proj_32.T).abs().mean().item()
+            print(f"零空间约束验证：历史特征与Δf_proj的平均点积={dot_product:.6f}（越接近0越好）")
+        
+        # 3. 验证：f_final与old_feat高相似（保留历史核心）
+        old_feat = cache_list[-2][0].float()  # 被替换的旧特征（转float32）
+        f_final = cache_list[-1][0].float()   # 最新更新的特征（转float32）
+        similarity = F.cosine_similarity(old_feat, f_final, dim=-1).item()
+        print(f"历史特征保留验证：f_old与f_final相似度={similarity:.4f}（>0.9表示保留核心）")
 
 def update_positive_cache(pos_cache, pos_cov, image_features, pred, loss, pos_params, pos_null_a, D):
     """
