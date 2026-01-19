@@ -22,6 +22,7 @@ def compute_nullspace_from_hist(cov_hist, a=4):
     """
     try:
         cov32 = cov_hist.float()
+        # print(cov32)
         # 数值稳定性：添加极小单位矩阵避免奇异值退化
         cov_stable = cov32 + 1e-6 * torch.eye(cov32.size(0), device=cov32.device)
         # 特征值分解（对称矩阵更高效）
@@ -33,9 +34,9 @@ def compute_nullspace_from_hist(cov_hist, a=4):
         mask = eigvals <= (a * lambda_min)  # 筛选零空间基
         
         # print(mask.sum().item(), "个零空间基向量被选中。")
-        # print(lambda_max.item(), "最大特征值。")
+        # print(lambda_min.item(), "最小特征值。")
         # print(eigvals)
-        # print(a * lambda_max)
+        # print(a * lambda_min)
         # print(mask)
         
         # # 分16块打印（1024/64=16），每块64个值
@@ -79,7 +80,6 @@ def replace_with_delta_projection(
     # 1. 累计特征到历史协方差
     new32 = new_feat.float()
     cov_hist32 = cov_hist.float()
-
     pos_cov_hist[class_idx] = (n_hist * cov_hist32 + new32.t() @ new32) / (n_hist + 1)
     # pos_cov_hist[class_idx] += new32.t() @ new32
     pos_hist_count[class_idx] += 1  # 累计数+1
@@ -98,6 +98,11 @@ def replace_with_delta_projection(
     f_corr = old_feat + Δ_proj
     f_corr = F.normalize(f_corr, dim=1)
 
+    # # 直接对新特征进行零空间投影修正
+    # f_corr = (new_feat.float() @ U2.float()) @ U2.float().T
+    # f_corr = f_corr.to(new_feat.dtype)
+    # f_corr = F.normalize(f_corr, dim=1)
+    
     # 6. 更新缓存并验证效果
     update_cache(pos_cache, class_idx, [f_corr, loss], pos_params['shot_capacity'])
     # verify_null_space_effect(pos_cache, class_idx, Δ_proj, old_feat, f_corr)
@@ -300,9 +305,9 @@ def main():
         print("\nRunning dataset configurations:")
         print(cfg, "\n")
         
-        test_loader, classnames, template = build_test_data_loader(dataset_name, args.data_root, preprocess) ## 测试图像的datacloader, 类别名称，模板
-        clip_weights = clip_classifier(classnames, template, clip_model) # [D, C] 特征维度 x class类别数
-        
+        test_loader, classnames, template, cupl_path = build_test_data_loader(dataset_name, args.data_root, preprocess) ## 测试图像的datacloader, 类别名称，模板
+        clip_weights = clip_classifier(classnames, template, cupl_path, clip_model) # [D, C] 特征维度 x class类别数
+
         if args.wandb:
             run_name = f"{dataset_name}"
             run = wandb.init(project="ETTA-CLIP", config=cfg, group=group_name, name=run_name)

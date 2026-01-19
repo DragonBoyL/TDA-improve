@@ -14,6 +14,7 @@ class DescribableTextures(DatasetBase):
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, 'images')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_DescribableTextures.json')
+        self.cupl_path = './gpt3_prompts/CuPL_prompts_dtd.json'
 
         self.template = template
 

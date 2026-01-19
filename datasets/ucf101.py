@@ -15,6 +15,7 @@ class UCF101(DatasetBase):
         self.dataset_dir = os.path.join(root, self.dataset_dir)
         self.image_dir = os.path.join(self.dataset_dir, 'UCF-101-midframes')
         self.split_path = os.path.join(self.dataset_dir, 'split_zhou_UCF101.json')
+        self.cupl_path = './gpt3_prompts/CuPL_prompts_ucf101.json'
 
         self.template = template
 

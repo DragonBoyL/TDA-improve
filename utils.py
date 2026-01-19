@@ -9,6 +9,7 @@ from datasets import build_dataset
 from datasets.utils import build_data_loader, AugMixAugmenter
 import torchvision.transforms as transforms
 from PIL import Image
+import json
 
 try:
     from torchvision.transforms import InterpolationMode
@@ -42,7 +43,12 @@ def cls_acc(output, target, topk=1):
     return acc
 
 
-def clip_classifier(classnames, template, clip_model):
+def clip_classifier(classnames, template, cupl_path = None, clip_model=None):
+    if cupl_path is not None:
+        f = open(cupl_path)
+        cupl = json.load(f)
+    else:
+        cupl = None
     with torch.no_grad():
         clip_weights = []
 
@@ -50,6 +56,8 @@ def clip_classifier(classnames, template, clip_model):
             # Tokenize the prompts
             classname = classname.replace('_', ' ')
             texts = [t.format(classname) for t in template] # template = ["a photo of a {}."] → ["a photo of a tench."]
+            if (cupl is not None):
+                texts += cupl[classname]
             texts = clip.tokenize(texts).cuda()
             # prompt ensemble for ImageNet
             class_embeddings = clip_model.encode_text(texts)    # [N, D]
@@ -142,4 +150,4 @@ def build_test_data_loader(dataset_name, root_path, preprocess):
     else:
         raise "Dataset is not from the chosen list"
     
-    return test_loader, dataset.classnames, dataset.template
+    return test_loader, dataset.classnames, dataset.template, dataset.cupl_path
