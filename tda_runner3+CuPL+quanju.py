@@ -11,38 +11,55 @@ import operator
 import clip
 from utils import *
     
+# def compute_nullspace_from_hist(cov_hist, thres):
+#     """
+#     基于「全局累计协方差」计算零空间基
+#     """
+
+#     _, eigen_value, eigen_vector = torch.svd(cov_hist.float(), some=False)
+#     ind = eigen_value <= eigen_value[-1] * thres
+#     print('reserving basis {}/{}; cond: {}, radio:{}'.format(
+#     ind.sum(), eigen_value.shape[0],
+#     eigen_value[0] /
+#     eigen_value[-1],
+#     eigen_value[ind].sum(
+#     ) / eigen_value.sum()
+#     ))
+
+#     U2 = eigen_vector[:, ind].to(cov_hist.dtype)
+#     return U2
+
+    
 def compute_nullspace_from_hist(cov_hist, a=4):
     """
-    基于「历史累计协方差」计算零空间基（核心：避开所有历史核心特征方向）
-    Args:
-        cov_hist: D×D 历史累计协方差（包含所有历史有效特征）
-        a: 零空间筛选阈值（越小约束越严格）
-    Returns:
-        U2: D×K 零空间基矩阵
+    基于「全局累计协方差」计算零空间基
     """
     try:
-        cov32 = cov_hist.float()
-        # print(cov32)
-        # 数值稳定性：添加极小单位矩阵避免奇异值退化
-        cov_stable = cov32 + 1e-6 * torch.eye(cov32.size(0), device=cov32.device)
+        if cov_hist is None or torch.allclose(cov_hist, torch.zeros_like(cov_hist)):
+            return None  # 无历史协方差时跳过投影
+        
+        # cov32 = cov_hist.float()
+        # # 数值稳定性：添加极小单位矩阵避免奇异值退化
+        # cov_stable = cov32 + 1e-6 * torch.eye(cov32.size(0), device=cov32.device)
         # 特征值分解（对称矩阵更高效）
-        eigvals, eigvecs = torch.linalg.eigh(cov_stable)  # eigvals: [D]，eigvecs: [D, D]
+        eigvals, eigvecs = torch.linalg.eigh(cov_hist.float())  # eigvals: [D]，eigvecs: [D, D]
         
-        # lambda_max = eigvals[-1].clamp(min=1e-12)
-        # mask = eigvals <= lambda_max * a 
-        lambda_min = eigvals[0].clamp(min=1e-12)  # 避免极小值导致计算错误
-        mask = eigvals <= (a * lambda_min)  # 筛选零空间基
+        lambda_max = eigvals[-1].clamp(min=1e-12)
+        mask = eigvals <= lambda_max
+
+        # lambda_min = eigvals[0].clamp(min=1e-12)  # 避免极小值导致计算错误
+        # mask = eigvals <= (a * lambda_min)  # 筛选零空间基
         
-        # print(mask.sum().item(), "个零空间基向量被选中。")
+        print(mask.sum().item(), "个零空间基向量被选中。")
         # print(lambda_min.item(), "最小特征值。")
-        # print(eigvals)
+        print(eigvals)
         # print(a * lambda_min)
-        # print(mask)
+        print(mask)
         
-        # 分16块打印（1024/64=16），每块64个值
-        for i in range(0, len(eigvals), 64):
-            end_idx = min(i+64, len(eigvals))
-            print(f"第{i}-{end_idx-1}个特征值：{eigvals[i:end_idx].cpu().numpy()}")
+        # # 分16块打印（1024/64=16），每块64个值
+        # for i in range(0, len(eigvals), 64):
+        #     end_idx = min(i+64, len(eigvals))
+        #     print(f"第{i}-{end_idx-1}个特征值：{eigvals[i:end_idx].cpu().numpy()}")
 
         U2 = eigvecs[:, mask].to(cov_hist.dtype)
         return U2
@@ -64,50 +81,71 @@ def get_arguments():
     return args
 
 def replace_with_delta_projection(
-    pos_cache, pos_cov_hist, pos_hist_count, 
-    class_idx, new_feat, loss, pos_params, a=4, entropy_threshold=1
+    pos_cache, global_cov_hist, 
+    class_idx, new_feat, loss, pos_params, a=4
 ):
     """
-    带历史累计协方差的零空间投影替换逻辑：
-        累计高置信特征到历史协方差（永不遗忘）
-        投影Δ到历史协方差的零空间（不干扰历史）
+    带全局协方差的零空间投影替换逻辑：
+        投影Δ到全局协方差的零空间（不干扰所有历史）
     """
     cache_list = pos_cache[class_idx]
     old_feat = cache_list[-1][0]  # 待替换的旧特征
-    cov_hist = pos_cov_hist[class_idx]  # 历史累计协方差
-    n_hist = pos_hist_count[class_idx]  # 历史累计样本数
 
-    # 1. 累计特征到历史协方差
-    new32 = new_feat.float()
-    cov_hist32 = cov_hist.float()
-    pos_cov_hist[class_idx] = (n_hist * cov_hist32 + new32.t() @ new32) / (n_hist + 1)
-    # pos_cov_hist[class_idx] += new32.t() @ new32
-    pos_hist_count[class_idx] += 1  # 累计数+1
-
-    # 2. 计算原始特征更新量Δ
+    # 1. 计算原始特征更新量Δ
     Δ = new_feat - old_feat   # [1, D]
 
-    # 3. 基于历史累计协方差计算零空间基（核心：全局不遗忘）
-    U2 = compute_nullspace_from_hist(cov_hist, a=a)
+    # 2. 基于全局累计协方差计算零空间基
+    U2 = compute_nullspace_from_hist(global_cov_hist, a)
 
-    # 4. Δ投影到零空间 + 步长限制（控制更新幅度）
-    Δ_proj = (Δ.float() @ U2.float()) @ U2.float().T
+    # 3. Δ投影到零空间
+    transform = torch.mm(U2, U2.transpose(1, 0))
+    transform = transform / torch.norm(transform)
+    Δ_proj = torch.mm(Δ.float(), transform.float())  # 投影到零空间
     Δ_proj = Δ_proj.to(Δ.dtype)
     
-    # 5. 得到修正后的特征（保留历史核心）
+    # 4. 得到修正后的特征（保留历史核心）
     f_corr = old_feat + Δ_proj
     f_corr = F.normalize(f_corr, dim=1)
-
-    # # 直接对新特征进行零空间投影修正
-    # f_corr = (new_feat.float() @ U2.float()) @ U2.float().T
-    # f_corr = f_corr.to(new_feat.dtype)
-    # f_corr = F.normalize(f_corr, dim=1)
     
-    # 6. 更新缓存并验证效果
+    # 5. 更新缓存
     update_cache(pos_cache, class_idx, [f_corr, loss], pos_params['shot_capacity'])
-    # verify_null_space_effect(pos_cache, class_idx, Δ_proj, old_feat, f_corr)
-
     return True
+
+def project_feat_to_nullspace(feat, cov_hist, a=4):
+    """
+    将特征投影到全局协方差的零空间（通用函数，新增/替换特征均复用）
+    Args:
+        feat: 待投影的特征 [1, D]
+        cov_hist: 全局历史协方差 [D, D]
+        a: 零空间筛选阈值
+    Returns:
+        proj_feat: 投影后的特征 [1, D]
+    """
+    with torch.no_grad():
+        U2 = compute_nullspace_from_hist(cov_hist, a)
+        if U2 is None or U2.size(1) == 0:
+            return F.normalize(feat, dim=1)  # 无零空间时仅归一化
+        
+        transform = torch.mm(U2, U2.transpose(1, 0))
+        print(transform)
+        transform = transform / torch.norm(transform)
+        proj_feat = torch.mm(feat.float(), transform.float())  # 投影到零空间
+        # 投影到零空间 + 归一化
+        proj_feat = proj_feat.to(feat.dtype)
+        proj_feat = F.normalize(proj_feat, dim=1)
+        return proj_feat
+
+def accumulate_global_cov(cov_hist, hist_count, new_feat):
+
+    with torch.no_grad():
+        new32 = new_feat.float()
+        cov32 = cov_hist.float() if cov_hist is not None else torch.zeros((new_feat.size(1), new_feat.size(1)), device=new_feat.device, dtype=torch.float32)
+        
+        # 加权平均累计
+        updated_cov = (hist_count * cov32 + new32.t() @ new32) / (hist_count + 1)
+        # updated_cov = cov32 + new32.t() @ new32
+        updated_count = hist_count + 1
+        return updated_cov.to(new_feat.dtype), updated_count
 
 def verify_null_space_effect(pos_cache, class_idx, delta_f_proj, old_feat, f_corr):
     """验证零空间约束：Δf_proj与历史缓存特征正交（不干扰预测）"""
@@ -133,8 +171,8 @@ def verify_null_space_effect(pos_cache, class_idx, delta_f_proj, old_feat, f_cor
         print(f"历史特征保留验证：f_old与f_final相似度={similarity:.4f}（>0.9表示保留核心）")
 
 def update_positive_cache(
-    pos_cache, pos_cov_hist, pos_hist_count,
-    image_features, pred, loss, pos_params, pos_null_a, D, entropy_threshold=1
+    pos_cache, global_cov_hist, global_hist_count,
+    image_features, pred, loss, pos_params, pos_null_a, D
 ):
     """
     带历史累计协方差的正缓存更新函数：
@@ -146,40 +184,42 @@ def update_positive_cache(
         class_idx = pred  # 当前样本的预测类别索引
         cache_list = pos_cache.get(class_idx, [])   # 当前类的缓存列表
 
-        # 初始化协方差（当前缓存+历史累计）
-        if class_idx not in pos_cov_hist:
-            pos_cov_hist[class_idx] = torch.zeros((D, D), device=new_feat.device, dtype=new_feat.dtype)
-            pos_hist_count[class_idx] = 0  # 历史累计数初始为0
+        # 初始化协方差
+        if global_cov_hist is None:
+            global_cov_hist = torch.zeros((D, D), device=new_feat.device, dtype=new_feat.dtype)
+            global_hist_count = 0
 
         # Case 1: 缓存没满 → 直接加入 + 累计历史协方差
         if len(cache_list) < pos_params['shot_capacity']:
-            new32 = new_feat.float()
-            cov_hist32 = pos_cov_hist[class_idx].float()
-            n_hist = pos_hist_count[class_idx]
-            pos_cov_hist[class_idx] = (n_hist * cov_hist32 + new32.t() @ new32) / (n_hist + 1)
-            # pos_cov_hist[class_idx] += new32.t() @ new32
-            pos_hist_count[class_idx] += 1
-            # 加入缓存
-            update_cache(pos_cache, class_idx, [new_feat, loss], pos_params['shot_capacity'])
-            return 
+            proj_feat = project_feat_to_nullspace(new_feat, global_cov_hist, a=pos_null_a)
+            update_cache(pos_cache, class_idx, [proj_feat, loss], pos_params['shot_capacity'])
+            # 累计全局协方差
+            global_cov_hist, global_hist_count = accumulate_global_cov(global_cov_hist, global_hist_count, new_feat)
+            return global_cov_hist, global_hist_count
         
         # Case 2: 缓存已满 + 新样本熵更大 → 忽略，不更新
         last_loss = cache_list[-1][1]
         if loss >= last_loss:
-            return  
+            global_cov_hist, global_hist_count = accumulate_global_cov(global_cov_hist, global_hist_count, new_feat)
+            return global_cov_hist, global_hist_count 
         
         # Case 3: 缓存已满 + 新样本熵更小 → 零空间投影替换
         success = replace_with_delta_projection(
-            pos_cache, pos_cov_hist, pos_hist_count,
-            class_idx, new_feat, loss, pos_params,
-            a=pos_null_a, entropy_threshold=entropy_threshold
+            pos_cache=pos_cache,
+            global_cov_hist=global_cov_hist,
+            class_idx=class_idx,
+            new_feat=new_feat,
+            loss=loss,
+            pos_params=pos_params,
+            a=pos_null_a
         )
-    
+        global_cov_hist, global_hist_count = accumulate_global_cov(global_cov_hist, global_hist_count, new_feat)
+
         if not success:
             print("跳过替换操作。")
             return
         
-        return 
+        return global_cov_hist, global_hist_count
 
 def update_cache(cache, pred, features_loss, shot_capacity, include_prob_map=False):
     """Update cache with new features and loss, maintaining the maximum shot capacity.
@@ -230,8 +270,9 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
         
         D = clip_weights.size(0)  # 特征维度（CLIP输出维度，RN50=1024，ViT-B/16=512）
 
-        pos_cov_hist = {}  # 历史累计协方差（全局不遗忘）
-        pos_hist_count = {}  # 历史累计样本数
+        # 全局协方差
+        global_cov_hist = None
+        global_hist_count = 0
 
         #Unpack all hyperparameters
         pos_enabled, neg_enabled = pos_cfg['enabled'], neg_cfg['enabled']
@@ -246,18 +287,18 @@ def run_test_tda(pos_cfg, neg_cfg, loader, clip_model, clip_weights):
             target, prop_entropy = target.cuda(), get_entropy(loss, clip_weights) # 对熵进行归一化
 
             if pos_enabled:
-                update_positive_cache(
-                    pos_cache=pos_cache,
-                    pos_cov_hist=pos_cov_hist,
-                    pos_hist_count=pos_hist_count,
-                    image_features=image_features,
-                    pred=pred,
-                    loss=loss,
-                    pos_params=pos_params,
-                    pos_null_a=5,
-                    D=D,
-                )
-                # update_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])
+                # global_cov_hist, global_hist_count = update_positive_cache(
+                #     pos_cache=pos_cache,
+                #     global_cov_hist=global_cov_hist,
+                #     global_hist_count=global_hist_count,
+                #     image_features=image_features,
+                #     pred=pred,
+                #     loss=loss,
+                #     pos_params=pos_params,
+                #     pos_null_a=1000,
+                #     D=D,
+                # )
+                update_cache(pos_cache, pred, [image_features, loss], pos_params['shot_capacity'])
 
             if neg_enabled and neg_params['entropy_threshold']['lower'] < prop_entropy < neg_params['entropy_threshold']['upper']:
                 update_cache(neg_cache, pred, [image_features, loss, prob_map], neg_params['shot_capacity'], True)
